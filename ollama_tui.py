@@ -10,6 +10,8 @@ import urllib.request
 import subprocess
 import selectors
 import argparse
+import queue
+import threading
 
 
 DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -188,6 +190,69 @@ def load_model(name, host=None):
         return True, ""
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
         return False, str(exc)
+
+
+def run_model_op(op, event_queue):
+    kind = op.get("kind")
+    host = op.get("host")
+    if kind == "switch":
+        prev_model = op.get("prev_model")
+        if prev_model:
+            event_queue.put({"kind": "phase", "phase": "offload", "model": prev_model})
+            ok, detail = offload_model(prev_model, host)
+            if not ok:
+                event_queue.put(
+                    {
+                        "kind": "result",
+                        "op": "switch",
+                        "ok": False,
+                        "detail": detail,
+                        "model": op.get("model"),
+                        "prev_model": prev_model,
+                        "failed_phase": "offload",
+                    }
+                )
+                return
+        event_queue.put({"kind": "phase", "phase": "load", "model": op.get("model")})
+        ok, detail = load_model(op.get("model"), host)
+        event_queue.put(
+            {
+                "kind": "result",
+                "op": "switch",
+                "ok": ok,
+                "detail": detail,
+                "model": op.get("model"),
+                "prev_model": prev_model,
+                "failed_phase": "load" if not ok else None,
+            }
+        )
+        return
+    if kind == "load":
+        event_queue.put({"kind": "phase", "phase": "load", "model": op.get("model")})
+        ok, detail = load_model(op.get("model"), host)
+        event_queue.put(
+            {
+                "kind": "result",
+                "op": "load",
+                "ok": ok,
+                "detail": detail,
+                "model": op.get("model"),
+            }
+        )
+        return
+    if kind == "offload":
+        event_queue.put({"kind": "phase", "phase": "offload", "model": op.get("model")})
+        ok, detail = offload_model(op.get("model"), host)
+        event_queue.put(
+            {
+                "kind": "result",
+                "op": "offload",
+                "ok": ok,
+                "detail": detail,
+                "model": op.get("model"),
+                "affects_current": op.get("affects_current", False),
+            }
+        )
 
 
 REASONING_FIELDS = ("reasoning", "thinking", "analysis", "thought", "thoughts")
@@ -1207,38 +1272,49 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
     raw = cmd.strip()
     parts = raw.split()
     if not parts:
-        return model, host, models, "", False, active_idx, next_chat_id, False
+        return model, host, models, "", False, active_idx, next_chat_id, False, pending_delete_id, None
     name = parts[0].lower()
     current = chats[active_idx]
 
     if name in ("/quit", "/q"):
-        return model, host, models, "quit", True, active_idx, next_chat_id, False, None
+        return model, host, models, "quit", True, active_idx, next_chat_id, False, None, None
     if name in ("/clear", "/c"):
         current["history"].clear()
         current["messages"].clear()
-        return model, host, models, "cleared", False, active_idx, next_chat_id, True, None
+        return model, host, models, "cleared", False, active_idx, next_chat_id, True, None, None
     if name in ("/help", "/h"):
         help_text = build_help_text()
         current["history"].append(("system", help_text))
-        return model, host, models, "", False, active_idx, next_chat_id, True, None
+        return model, host, models, "", False, active_idx, next_chat_id, True, None, None
     if name in ("/models",):
         models = list_models(host)
         if models:
             current["history"].append(("system", "Available models: " + ", ".join(models)))
-            return model, host, models, "", False, active_idx, next_chat_id, True, None
+            return model, host, models, "", False, active_idx, next_chat_id, True, None, None
         current["history"].append(("system", "No models found (is ollama running?)"))
-        return model, host, models, "", False, active_idx, next_chat_id, True, None
+        return model, host, models, "", False, active_idx, next_chat_id, True, None, None
     if name in ("/model",):
         if len(parts) < 2:
-            return model, host, models, "usage: /model <name>", False, active_idx, next_chat_id, False, None
+            return model, host, models, "usage: /model <name>", False, active_idx, next_chat_id, False, None, None
         candidate = parts[1]
         models = list_models(host)
         if candidate in models or not models:
-            return candidate, host, models, f"model set to {candidate}", False, active_idx, next_chat_id, True, None
-        return model, host, models, f"model not found: {candidate}", False, active_idx, next_chat_id, False, None
+            return (
+                candidate,
+                host,
+                models,
+                f"model set to {candidate}",
+                False,
+                active_idx,
+                next_chat_id,
+                True,
+                None,
+                {"kind": "set_model", "model": candidate},
+            )
+        return model, host, models, f"model not found: {candidate}", False, active_idx, next_chat_id, False, None, None
     if name in ("/chats",):
         current["history"].append(("system", format_chat_list(chats, active_idx)))
-        return model, host, models, "", False, active_idx, next_chat_id, True, None
+        return model, host, models, "", False, active_idx, next_chat_id, True, None, None
     if name in ("/chat",):
         args = raw[len(parts[0]) :].strip()
         if not args:
@@ -1252,6 +1328,7 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
                 next_chat_id,
                 False,
                 None,
+                None,
             )
         tokens = args.split()
         action = tokens[0].lower()
@@ -1261,9 +1338,9 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
             chats.append(chat)
             active_idx = len(chats) - 1
             next_chat_id += 1
-            return model, host, models, f"switched to chat {chat['id']}", False, active_idx, next_chat_id, True, None
+            return model, host, models, f"switched to chat {chat['id']}", False, active_idx, next_chat_id, True, None, None
         if action in ("cancel", "can"):
-            return model, host, models, "action cancelled", False, active_idx, next_chat_id, False, None
+            return model, host, models, "action cancelled", False, active_idx, next_chat_id, False, None, None
         if action in ("delete", "del", "rm"):
             if len(tokens) >= 2 and tokens[1].isdigit():
                 chat_id = int(tokens[1])
@@ -1272,7 +1349,7 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
 
             idx = find_chat_index(chats, chat_id)
             if idx is None:
-                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None
+                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None, None
 
             if pending_delete_id == chat_id:
                 # Confirmed deletion
@@ -1289,12 +1366,12 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
                         active_idx = min(idx, len(chats) - 1)
                     elif idx < active_idx:
                         active_idx -= 1
-                return model, host, models, status, False, active_idx, next_chat_id, True, None
+                return model, host, models, status, False, active_idx, next_chat_id, True, None, None
             else:
                 # Request confirmation
                 title = chats[idx]["title"]
                 status = f"Delete chat '{title}' (ID {chat_id})? Run command again to confirm or /chat cancel."
-                return model, host, models, status, False, active_idx, next_chat_id, False, chat_id
+                return model, host, models, status, False, active_idx, next_chat_id, False, chat_id, None
         if action in ("title", "rename"):
             remainder = args[len(tokens[0]) :].strip()
             if not remainder:
@@ -1307,6 +1384,7 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
                     active_idx,
                     next_chat_id,
                     False,
+                    None,
                     None,
                 )
             remainder_tokens = remainder.split()
@@ -1327,10 +1405,11 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
                     next_chat_id,
                     False,
                     None,
+                    None,
                 )
             idx = find_chat_index(chats, chat_id)
             if idx is None:
-                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None
+                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None, None
             chats[idx]["title"] = new_title
             return (
                 model,
@@ -1342,14 +1421,15 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
                 next_chat_id,
                 True,
                 None,
+                None,
             )
         if action.isdigit():
             chat_id = int(action)
             idx = find_chat_index(chats, chat_id)
             if idx is None:
-                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None
+                return model, host, models, f"chat not found: {chat_id}", False, active_idx, next_chat_id, False, None, None
             active_idx = idx
-            return model, host, models, f"switched to chat {chat_id}", False, active_idx, next_chat_id, True, None
+            return model, host, models, f"switched to chat {chat_id}", False, active_idx, next_chat_id, True, None, None
         return (
             model,
             host,
@@ -1360,23 +1440,24 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
             next_chat_id,
             False,
             None,
+            None,
         )
     if name in ("/system",):
         if len(parts) < 2:
-            return model, host, models, "usage: /system <text|clear>", False, active_idx, next_chat_id, False, None
+            return model, host, models, "usage: /system <text|clear>", False, active_idx, next_chat_id, False, None, None
         text = raw[len(parts[0]) :].strip()
         if text.lower() in ("clear", "off", "none"):
             current["system"] = ""
-            return model, host, models, "system prompt cleared", False, active_idx, next_chat_id, True, None
+            return model, host, models, "system prompt cleared", False, active_idx, next_chat_id, True, None, None
         current["system"] = text
-        return model, host, models, "system prompt set", False, active_idx, next_chat_id, True, None
+        return model, host, models, "system prompt set", False, active_idx, next_chat_id, True, None, None
     if name in ("/retry",):
-        return model, host, models, "retry", False, active_idx, next_chat_id, False, None
+        return model, host, models, "retry", False, active_idx, next_chat_id, False, None, None
     if name in ("/host",):
         if len(parts) < 2:
-            return model, host, models, "usage: /host <url>", False, active_idx, next_chat_id, False, None
+            return model, host, models, "usage: /host <url>", False, active_idx, next_chat_id, False, None, None
         host = parts[1]
-        return model, host, models, f"host set to {host}", False, active_idx, next_chat_id, True, None
+        return model, host, models, f"host set to {host}", False, active_idx, next_chat_id, True, None, None
     if name in ("/save",):
         path = None
         if len(parts) >= 2:
@@ -1385,23 +1466,30 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
             path = default_export_path(current.get("title") or "chat")
         try:
             save_history(path, current["history"])
-            return model, host, models, f"saved to {path}", False, active_idx, next_chat_id, False, None
+            return model, host, models, f"saved to {path}", False, active_idx, next_chat_id, False, None, None
         except OSError as exc:
-            return model, host, models, f"save failed: {exc}", False, active_idx, next_chat_id, False, None
+            return model, host, models, f"save failed: {exc}", False, active_idx, next_chat_id, False, None, None
     if name in ("/offload", "/stop"):
         target = parts[1] if len(parts) >= 2 else model
-        ok, detail = offload_model(target, host)
-        if ok:
-            return model, host, models, f"offloaded model {target}", False, active_idx, next_chat_id, False, None
-        msg = f"offload failed: {detail}" if detail else "offload failed"
-        return model, host, models, msg, False, active_idx, next_chat_id, False, None
+        return (
+            model,
+            host,
+            models,
+            f"offloading model {target}...",
+            False,
+            active_idx,
+            next_chat_id,
+            False,
+            None,
+            {"kind": "offload", "model": target},
+        )
 
-    return model, host, models, f"unknown command: {name}", False, active_idx, next_chat_id, False, None
+    return model, host, models, f"unknown command: {name}", False, active_idx, next_chat_id, False, None, None
 
 
 def main(stdscr, cli_model=None):
     curses.curs_set(1)
-    stdscr.nodelay(False)
+    stdscr.timeout(100)
     stdscr.keypad(True)
     init_styles()
 
@@ -1437,12 +1525,90 @@ def main(stdscr, cli_model=None):
     input_hist_idx = None
     last_user_text = ""
     pending_delete_id = None
+    model_events = queue.Queue()
+    model_loaded = False
+    model_busy = False
+    model_busy_affects_current = False
+
+    def start_model_op(op):
+        nonlocal model_busy, model_busy_affects_current
+        model_busy = True
+        model_busy_affects_current = op.get("affects_current", True)
+        thread = threading.Thread(target=run_model_op, args=(op, model_events), daemon=True)
+        thread.start()
+
+    def drain_model_events():
+        nonlocal model_busy, model_busy_affects_current, model_loaded, status_msg, last_status_time, model
+        while True:
+            try:
+                event = model_events.get_nowait()
+            except queue.Empty:
+                break
+            if event.get("kind") == "phase":
+                phase = event.get("phase")
+                if phase == "offload":
+                    status_msg = f"offloading model {event.get('model')}..."
+                elif phase == "load":
+                    status_msg = f"loading model {event.get('model')}..."
+                last_status_time = time.time()
+                continue
+
+            if event.get("kind") != "result":
+                continue
+
+            model_busy = False
+            model_busy_affects_current = False
+            op = event.get("op")
+            ok = event.get("ok")
+            detail = event.get("detail") or ""
+
+            if op == "switch":
+                if ok:
+                    model_loaded = True
+                    status_msg = ""
+                else:
+                    failed_phase = event.get("failed_phase")
+                    if failed_phase == "offload":
+                        prev_model = event.get("prev_model")
+                        if prev_model:
+                            model = prev_model
+                            save_session(DEFAULT_SESSION_PATH, chats, active_idx, next_chat_id, model, host)
+                        model_loaded = True
+                        status_msg = f"offload failed: {detail}" if detail else "offload failed"
+                    else:
+                        model_loaded = False
+                        status_msg = f"load failed: {detail}" if detail else "load failed"
+                last_status_time = time.time()
+                continue
+
+            if op == "load":
+                if ok:
+                    model_loaded = True
+                    status_msg = ""
+                else:
+                    model_loaded = False
+                    status_msg = f"load failed: {detail}" if detail else "load failed"
+                    last_status_time = time.time()
+                continue
+
+            if op == "offload":
+                affects_current = event.get("affects_current", False)
+                if ok:
+                    if affects_current:
+                        model_loaded = False
+                    status_msg = f"offloaded model {event.get('model')}"
+                else:
+                    if affects_current:
+                        model_loaded = True
+                    status_msg = f"offload failed: {detail}" if detail else "offload failed"
+                last_status_time = time.time()
 
     current = chats[active_idx]
     history = current["history"]
     chat_title = current["title"]
     status_msg = f"loading model {model}..."
     last_status_time = time.time()
+    start_model_op({"kind": "load", "model": model, "host": host, "affects_current": True})
     scroll = draw(
         stdscr,
         history,
@@ -1455,14 +1621,9 @@ def main(stdscr, cli_model=None):
         suggestions,
         suggest_idx,
     )
-    ok, detail = load_model(model, host)
-    if ok:
-        status_msg = ""
-    else:
-        status_msg = f"load failed: {detail}" if detail else "load failed"
-        last_status_time = time.time()
 
     while True:
+        drain_model_events()
         suggestions = get_command_suggestions(input_buf)
         if [cmd["name"] for cmd in suggestions] != [cmd["name"] for cmd in prev_suggestions]:
             suggest_idx = 0
@@ -1490,7 +1651,7 @@ def main(stdscr, cli_model=None):
             suggest_idx,
         )
 
-        if status_msg and time.time() - last_status_time > 3:
+        if status_msg and time.time() - last_status_time > 3 and not model_busy:
             status_msg = ""
 
         ch = stdscr.getch()
@@ -1586,6 +1747,7 @@ def main(stdscr, cli_model=None):
             if not text:
                 continue
 
+            retry_text = None
             if text.startswith("/"):
                 prev_active_idx = active_idx
                 prev_model = model
@@ -1599,6 +1761,7 @@ def main(stdscr, cli_model=None):
                     next_chat_id,
                     should_save,
                     pending_delete_id,
+                    model_action,
                 ) = handle_command(
                     text,
                     chats,
@@ -1611,71 +1774,73 @@ def main(stdscr, cli_model=None):
                 )
                 if status_msg == "retry":
                     if last_user_text:
-                        text = last_user_text
+                        retry_text = last_user_text
                         status_msg = ""
                     else:
                         status_msg = "nothing to retry"
                         last_status_time = time.time()
                         continue
                 else:
+                    if model_action:
+                        if model_busy:
+                            status_msg = "model operation in progress"
+                            last_status_time = time.time()
+                            if model_action.get("kind") == "set_model":
+                                model = prev_model
+                                should_save = False
+                            model_action = None
+                        else:
+                            if model_action.get("kind") == "set_model":
+                                if not model_loaded or model != prev_model:
+                                    if model_loaded and prev_model and prev_model != model:
+                                        op = {
+                                            "kind": "switch",
+                                            "model": model,
+                                            "prev_model": prev_model,
+                                            "host": host,
+                                            "affects_current": True,
+                                        }
+                                    else:
+                                        op = {
+                                            "kind": "load",
+                                            "model": model,
+                                            "host": host,
+                                            "affects_current": True,
+                                        }
+                                    start_model_op(op)
+                                    status_msg = f"loading model {model}..."
+                                    last_status_time = time.time()
+                            elif model_action.get("kind") == "offload":
+                                target = model_action.get("model")
+                                affects_current = target == model and model_loaded
+                                op = {
+                                    "kind": "offload",
+                                    "model": target,
+                                    "host": host,
+                                    "affects_current": affects_current,
+                                }
+                                start_model_op(op)
+                                status_msg = f"offloading model {target}..."
+                                last_status_time = time.time()
                     if should_save:
                         save_session(DEFAULT_SESSION_PATH, chats, active_idx, next_chat_id, model, host)
                 if status_msg:
                     last_status_time = time.time()
                 if active_idx != prev_active_idx:
                     scroll = 0
-                if model != prev_model:
-                    current = chats[active_idx]
-                    history = current["history"]
-                    chat_title = current["title"]
-                    offload_ok = True
-                    offload_detail = ""
-                    if prev_model:
-                        status_msg = f"offloading model {prev_model}..."
-                        last_status_time = time.time()
-                        scroll = draw(
-                            stdscr,
-                            history,
-                            input_buf,
-                            cursor_idx,
-                            status_msg,
-                            model,
-                            chat_title,
-                            scroll,
-                            suggestions,
-                            suggest_idx,
-                        )
-                        offload_ok, offload_detail = offload_model(prev_model, host)
-                    if not offload_ok:
-                        model = prev_model
-                        status_msg = (
-                            f"offload failed: {offload_detail}" if offload_detail else "offload failed"
-                        )
-                        last_status_time = time.time()
-                        save_session(DEFAULT_SESSION_PATH, chats, active_idx, next_chat_id, model, host)
-                    else:
-                        status_msg = f"loading model {model}..."
-                        last_status_time = time.time()
-                        scroll = draw(
-                            stdscr,
-                            history,
-                            input_buf,
-                            cursor_idx,
-                            status_msg,
-                            model,
-                            chat_title,
-                            scroll,
-                            suggestions,
-                            suggest_idx,
-                        )
-                        ok, detail = load_model(model, host)
-                        if ok:
-                            status_msg = ""
-                        else:
-                            status_msg = f"load failed: {detail}" if detail else "load failed"
-                        last_status_time = time.time()
                 if should_quit:
                     break
+                if retry_text is None:
+                    continue
+                text = retry_text
+
+            if model_busy_affects_current:
+                status_msg = "model operation in progress"
+                last_status_time = time.time()
+                continue
+            if not model_loaded:
+                status_msg = "no model loaded (use /model <name>)"
+                last_status_time = time.time()
                 continue
 
             history.append(("user", text))
