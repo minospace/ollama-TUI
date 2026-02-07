@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 import subprocess
 import selectors
+import argparse
 
 
 DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -1398,7 +1399,7 @@ def handle_command(cmd, chats, active_idx, models, model, host, next_chat_id, pe
     return model, host, models, f"unknown command: {name}", False, active_idx, next_chat_id, False, None
 
 
-def main(stdscr):
+def main(stdscr, cli_model=None):
     curses.curs_set(1)
     stdscr.nodelay(False)
     stdscr.keypad(True)
@@ -1422,6 +1423,8 @@ def main(stdscr):
         next_chat_id = session.get("next_chat_id", next_chat_id)
         model = session.get("model", model)
         host = session.get("host", host)
+    if cli_model:
+        model = cli_model
     input_buf = ""
     cursor_idx = 0
     status_msg = ""
@@ -1803,6 +1806,9 @@ def main(stdscr):
 
 if __name__ == "__main__":
     try:
-        curses.wrapper(main)
+        parser = argparse.ArgumentParser(description="Terminal UI for chatting with Ollama models")
+        parser.add_argument("--model", help="Model name to load on startup")
+        args = parser.parse_args()
+        curses.wrapper(main, args.model)
     except KeyboardInterrupt:
         pass

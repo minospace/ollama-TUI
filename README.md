@@ -13,6 +13,11 @@ Assistant responses are shown as plain text (Markdown rendering is disabled).
 python3 ollama_tui.py
 ```
 
+Start with a specific model:
+```bash
+python3 ollama_tui.py --model llama3
+```
+
 Optionally set a different host:
 ```bash
 OLLAMA_HOST=http://localhost:11434 python3 ollama_tui.py
